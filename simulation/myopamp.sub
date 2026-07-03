@@ -1,0 +1,5 @@
+.subckt opamp2 In+ In- V+ V- OUT
+Rin In+ In- 500Meg
+Rp V+ V- 500Meg
+E1 OUT 0 In+ In- 100K
+.ends opamp2
