@@ -115,7 +115,7 @@ retrolink-ecu/
 ## Status
 
 - [x] Signal conditioning circuit designed and simulated
-- [ ] STM32CubeMX project configured
+- [x] STM32CubeMX project configured
 - [ ] FreeRTOS tasks implemented
 - [ ] CAN bus communication tested
 - [ ] Physical build and integration
