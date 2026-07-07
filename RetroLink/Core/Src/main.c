@@ -23,6 +23,9 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
+#include <stdio.h>
+#include <string.h>
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -70,7 +73,11 @@ const osThreadAttr_t displayTask_attributes = {
   .stack_size = 128 * 4,
   .priority = (osPriority_t) osPriorityBelowNormal,
 };
+
 /* USER CODE BEGIN PV */
+
+volatile uint16_t adc_raw[2];		// Raw 12-bit ADC readings (0-4095)
+volatile float sensor_voltage[2];	// Converted voltage (0-3.3V)
 
 /* USER CODE END PV */
 
@@ -408,37 +415,91 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN Header_StartSensorTask */
 /**
   * @brief  Function implementing the sensorTask thread.
+  * 		Starts the ADC, waits for the conversion to finish,
+  * 		reads the 12-bit result (0-4095), converts to voltage
+  * 		([raw / 4095] * 3.3V), then repeats for second channel.
+  * 		Has a 10 Hz sample rate.
   * @param  argument: Not used
   * @retval None
   */
 /* USER CODE END Header_StartSensorTask */
 void StartSensorTask(void *argument)
 {
-  /* USER CODE BEGIN 5 */
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
-  /* USER CODE END 5 */
+	/* USER CODE BEGIN 5 */
+	/* Infinite loop */
+	for(;;) {
+	  // Channel 0 (PA0) - coolant temperature sensor
+	  HAL_ADC_Start(&hadc1);
+	  if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
+		  adc_raw[0] = HAL_ADC_GetValue(&hadc1);
+		  sensor_voltage[0] = (float)adc_raw[0] * 3.3f / 4095.0f;
+	  }
+	  HAL_ADC_Stop(&hadc1);
+
+	  // Channel 1 (PA1) - TPS
+	  HAL_ADC_Start(&hadc1);
+	  if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
+		  adc_raw[1] = HAL_ADC_GetValue(&hadc1);
+		  sensor_voltage[1] = (float)adc_raw[1] * 3.3f / 4095.0f;
+	  }
+	  HAL_ADC_Stop(&hadc1);
+
+	  osDelay(100);
+	}
+	/* USER CODE END 5 */
 }
 
 /* USER CODE BEGIN Header_StartCanTask */
 /**
 * @brief Function implementing the canTask thread.
+* 		 Sets up a CAN transmit header with message ID 0x100
+* 		 - StdId: an 11-bit identifier that tells receivers
+* 		   "this frame contains sensor data"
+* 		 - DLC: Data Length Code = 4 bytes, 2 per sensor
+* 		 - RTR: DATA frame (not a Remote request)
+* 		 Packs the two raw ADC values into the data payload
+* 		 - Each value is 12-bit (0-4095), which fits in 2 bytes
+* 		 - High byte first, then low byte (big-endian)
+* 		 Sends the frame on the CAN bus
+* 		 Has a 5 Hz transmit rate
 * @param argument: Not used
 * @retval None
 */
 /* USER CODE END Header_StartCanTask */
 void StartCanTask(void *argument)
 {
-  /* USER CODE BEGIN StartCanTask */
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
-  /* USER CODE END StartCanTask */
+	/* USER CODE BEGIN StartCanTask */
+
+	CAN_TxHeaderTypeDef tx_header;
+	uint8_t tx_data[8];
+	uint32_t tx_mailbox;
+
+	// COnfigure the CAN frame header
+	tx_header.StdId = 0x100;					// Arbitration ID
+	tx_header.ExtId = 0;						// Not using extended ID
+	tx_header.RTR = CAN_RTR_DATA;				// Data frame, not remote request
+	tx_header.IDE = CAN_ID_STD;				// Standard 11-bit ID
+	tx_header.DLC = 4;						// 4 bytes of data
+	tx_header.TransmitGlobalTime = DISABLE;
+
+	// Start the CAN peripheral
+	HAL_CAN_Start(&hcan1);
+
+	for (;;) {
+	  // Pack sensor 0 into bytes 0-1 (big-endian)
+	  tx_data[0] = (adc_raw[0] >> 8) & 0xFF;
+	  tx_data[1] = adc_raw[0] & 0xFF;
+
+	  // Pack sensor 1 inot bytes 2-3 (big-endian)
+	  tx_data[2] = (adc_raw[1] >> 8) & 0xFF;
+	  tx_data[3] = adc_raw[1] & 0xFF;
+
+	  // Transmit - HAL puts it in the next available mailbox
+	  HAL_CAN_AddTxMessage(&hcan1, &tx_header, tx_data, &tx_mailbox);
+
+	  osDelay(200);
+	}
+	/* USER CODE END StartCanTask */
 }
 
 /* USER CODE BEGIN Header_StartDisplayTask */
@@ -450,13 +511,21 @@ void StartCanTask(void *argument)
 /* USER CODE END Header_StartDisplayTask */
 void StartDisplayTask(void *argument)
 {
-  /* USER CODE BEGIN StartDisplayTask */
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
-  /* USER CODE END StartDisplayTask */
+	/* USER CODE BEGIN StartDisplayTask */
+	char uart_buf[64];
+
+	for(;;) {
+		int mv0 = (adc_raw[0] * 3300) / 4095;
+		int mv1 = (adc_raw[1] * 3300) / 4095;
+		int len = sprintf(uart_buf, "S0: %d.%02dV  S1: %d.%02dV\r\n",
+		                  mv0/1000, (mv0%1000)/10, mv1/1000, (mv1%1000)/10);
+
+		// Send over the USART2
+		HAL_UART_Transmit(&huart2, (uint8_t *)uart_buf, len, 100);
+
+		osDelay(500);
+	}
+	/* USER CODE END StartDisplayTask */
 }
 
 /**
