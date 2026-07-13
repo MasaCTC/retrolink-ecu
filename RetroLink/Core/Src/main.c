@@ -25,6 +25,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include "ssd1306.h"
 
 /* USER CODE END Includes */
 
@@ -70,7 +71,7 @@ const osThreadAttr_t canTask_attributes = {
 osThreadId_t displayTaskHandle;
 const osThreadAttr_t displayTask_attributes = {
   .name = "displayTask",
-  .stack_size = 128 * 4,
+  .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityBelowNormal,
 };
 /* USER CODE BEGIN PV */
@@ -551,16 +552,45 @@ void StartCanTask(void *argument)
 void StartDisplayTask(void *argument)
 {
   /* USER CODE BEGIN StartDisplayTask */
-	char uart_buf[64];
+	char buf[32];
+
+	/* Initialize the OLED — sends the startup command sequence
+	 * and clears the screen. Must happen once before drawing. */
+	ssd1306_Init(&hi2c1);
 
 	for(;;) {
+		/* Convert raw ADC counts to millivolts for display.
+		 * Integer math avoids pulling in the float printf library. */
 		int mv0 = (adc_raw[0] * 3300) / 4095;
 		int mv1 = (adc_raw[1] * 3300) / 4095;
-		int len = sprintf(uart_buf, "S0: %d.%02dV  S1: %d.%02dV\r\n",
-		                  mv0/1000, (mv0%1000)/10, mv1/1000, (mv1%1000)/10);
 
-		// Send over the USART2
-		HAL_UART_Transmit(&huart2, (uint8_t *)uart_buf, len, 100);
+		/* Clear the framebuffer, then draw fresh content */
+		ssd1306_Fill(SSD1306_COLOR_BLACK);
+
+		/* Title bar */
+		ssd1306_SetCursor(0, 0);
+		ssd1306_WriteString("RetroLink", Font_11x18, SSD1306_COLOR_WHITE);
+
+		/* Divider line under the title */
+		ssd1306_DrawHLine(0, 20, 128, SSD1306_COLOR_WHITE);
+
+		/* Sensor 0 — coolant temp */
+		sprintf(buf, "CLT: %d.%02dV", mv0/1000, (mv0%1000)/10);
+		ssd1306_SetCursor(0, 26);
+		ssd1306_WriteString(buf, Font_7x10, SSD1306_COLOR_WHITE);
+
+		/* Sensor 1 — throttle position */
+		sprintf(buf, "TPS: %d.%02dV", mv1/1000, (mv1%1000)/10);
+		ssd1306_SetCursor(0, 40);
+		ssd1306_WriteString(buf, Font_7x10, SSD1306_COLOR_WHITE);
+
+		/* Push the framebuffer to the display */
+		ssd1306_UpdateScreen();
+
+		/* Also keep the UART output for serial debugging */
+		int len = sprintf(buf, "S0:%d.%02d S1:%d.%02d\r\n",
+		                  mv0/1000, (mv0%1000)/10, mv1/1000, (mv1%1000)/10);
+		HAL_UART_Transmit(&huart2, (uint8_t *)buf, len, 100);
 
 		osDelay(500);
 	}
