@@ -37,6 +37,24 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
+/*--- Voltage divider scaling (ADC mV → sensor-side mV) ---
+ * Your signal conditioning circuit divides 5V sensor range down to
+ * 3.3V ADC-safe range. To recover the original sensor voltage:
+ *   sensor_mv = adc_mv * VDIV_NUM / VDIV_DEN
+ *
+ * Bench testing (pot wired direct to PA0/PA1): 1/1 = no scaling.
+ * Vehicle (through 5V→3.3V divider):          50/33 ≈ 1.515x.
+ */
+#define VDIV_NUM  1
+#define VDIV_DEN  1
+
+/* TPS calibration points (sensor-side millivolts).
+ * FSM spec: VTA = 0.1–1.0V closed, ~3.5V WOT.
+ * For bench testing, set these to your pot's actual range.
+ * For vehicle use, restore to 500 / 3500. */
+#define TPS_MV_CLOSED      0
+#define TPS_MV_WOT      2250
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -93,11 +111,84 @@ void StartCanTask(void *argument);
 void StartDisplayTask(void *argument);
 
 /* USER CODE BEGIN PFP */
-
+static int16_t clt_voltage_to_celsius(int sensor_mv);
+static int     tps_voltage_to_percent(int sensor_mv);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/*--- CLT lookup table: sensor-side millivolts → temperature °C ---
+ * Data from 3VZ-E NTC thermistor specs (89422-20010) with ~2.2kΩ
+ * pull-up to 5V reference. Voltage DECREASES as temp rises because
+ * NTC resistance drops, pulling the divider output lower.
+ *
+ * The table is sorted by decreasing voltage (= increasing temp).
+ * clt_voltage_to_celsius() walks the table and linearly interpolates
+ * between the two nearest points.
+ */
+typedef struct {
+    int16_t  temp_c;  /* temperature in °C */
+    uint16_t mv;      /* sensor-side voltage in millivolts */
+} CLT_Point;
+
+static const CLT_Point clt_table[] = {
+    { -20, 4400 },
+    {   0, 3600 },
+    {  20, 2700 },
+    {  40, 1700 },
+    {  60, 1000 },
+    {  80,  600 },
+    { 100,  500 },
+    { 120,  300 },
+};
+#define CLT_TABLE_SIZE  (sizeof(clt_table) / sizeof(clt_table[0]))
+
+/**
+ * @brief  Convert sensor-side millivolts to coolant temperature in °C.
+ *         Uses piecewise linear interpolation between table points.
+ * @param  sensor_mv  Voltage at the CLT sensor pin (millivolts)
+ * @retval Temperature in °C (clamped to table range: -20 to 120)
+ */
+static int16_t clt_voltage_to_celsius(int sensor_mv)
+{
+    /* Clamp to table endpoints */
+    if (sensor_mv >= (int)clt_table[0].mv)
+        return clt_table[0].temp_c;                       /* very cold */
+    if (sensor_mv <= (int)clt_table[CLT_TABLE_SIZE - 1].mv)
+        return clt_table[CLT_TABLE_SIZE - 1].temp_c;      /* very hot  */
+
+    /* Walk the table — voltage decreases as index increases */
+    for (int i = 0; i < (int)CLT_TABLE_SIZE - 1; i++) {
+        if (sensor_mv <= (int)clt_table[i].mv &&
+            sensor_mv >= (int)clt_table[i + 1].mv)
+        {
+            /* Linear interpolation:
+             *   fraction = (upper_mv - sensor_mv) / (upper_mv - lower_mv)
+             *   temp = upper_temp + fraction * (lower_temp - upper_temp)
+             *
+             * All integer math — multiply before divide to keep precision. */
+            int dv = clt_table[i].mv - clt_table[i + 1].mv;     /* positive */
+            int dt = clt_table[i + 1].temp_c - clt_table[i].temp_c; /* positive */
+            int offset = clt_table[i].mv - sensor_mv;
+            return clt_table[i].temp_c + (int16_t)((offset * dt) / dv);
+        }
+    }
+    return -99; /* should never reach here */
+}
+
+/**
+ * @brief  Convert sensor-side millivolts to throttle position 0–100%.
+ *         Simple linear interpolation between closed and WOT voltages.
+ * @param  sensor_mv  Voltage at the TPS VTA pin (millivolts)
+ * @retval Throttle position percentage, clamped to 0–100
+ */
+static int tps_voltage_to_percent(int sensor_mv)
+{
+    if (sensor_mv <= TPS_MV_CLOSED) return 0;
+    if (sensor_mv >= TPS_MV_WOT)   return 100;
+    return ((sensor_mv - TPS_MV_CLOSED) * 100) / (TPS_MV_WOT - TPS_MV_CLOSED);
+}
 
 /* USER CODE END 0 */
 
@@ -469,9 +560,18 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 void StartSensorTask(void *argument)
 {
   /* USER CODE BEGIN 5 */
-	/* Infinite loop */
+	/* The ADC has a multiplexer (mux) that selects which pin to read.
+	 * HAL_ADC_Start() does NOT change the selected channel — only
+	 * HAL_ADC_ConfigChannel() does. So we must call ConfigChannel
+	 * before each conversion to switch between PA0 and PA1. */
+	ADC_ChannelConfTypeDef sConfig = {0};
+	sConfig.Rank = 1;
+	sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES;
+
 	for(;;) {
-	  // Channel 0 (PA0) - coolant temperature sensor
+	  // Select Channel 0 (PA0) - coolant temperature sensor
+	  sConfig.Channel = ADC_CHANNEL_0;
+	  HAL_ADC_ConfigChannel(&hadc1, &sConfig);
 	  HAL_ADC_Start(&hadc1);
 	  if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
 		  adc_raw[0] = HAL_ADC_GetValue(&hadc1);
@@ -479,7 +579,9 @@ void StartSensorTask(void *argument)
 	  }
 	  HAL_ADC_Stop(&hadc1);
 
-	  // Channel 1 (PA1) - TPS
+	  // Select Channel 1 (PA1) - TPS
+	  sConfig.Channel = ADC_CHANNEL_1;
+	  HAL_ADC_ConfigChannel(&hadc1, &sConfig);
 	  HAL_ADC_Start(&hadc1);
 	  if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK) {
 		  adc_raw[1] = HAL_ADC_GetValue(&hadc1);
@@ -559,10 +661,16 @@ void StartDisplayTask(void *argument)
 	ssd1306_Init(&hi2c1);
 
 	for(;;) {
-		/* Convert raw ADC counts to millivolts for display.
-		 * Integer math avoids pulling in the float printf library. */
-		int mv0 = (adc_raw[0] * 3300) / 4095;
-		int mv1 = (adc_raw[1] * 3300) / 4095;
+		/* Convert raw ADC counts to millivolts, then scale
+		 * through the voltage divider to get sensor-side mV. */
+		int adc_mv0 = (adc_raw[0] * 3300) / 4095;
+		int adc_mv1 = (adc_raw[1] * 3300) / 4095;
+		int sen_mv0 = (adc_mv0 * VDIV_NUM) / VDIV_DEN;
+		int sen_mv1 = (adc_mv1 * VDIV_NUM) / VDIV_DEN;
+
+		/* Run the conversions */
+		int16_t clt_c   = clt_voltage_to_celsius(sen_mv0);
+		int     tps_pct = tps_voltage_to_percent(sen_mv1);
 
 		/* Clear the framebuffer, then draw fresh content */
 		ssd1306_Fill(SSD1306_COLOR_BLACK);
@@ -574,22 +682,30 @@ void StartDisplayTask(void *argument)
 		/* Divider line under the title */
 		ssd1306_DrawHLine(0, 20, 128, SSD1306_COLOR_WHITE);
 
-		/* Sensor 0 — coolant temp */
-		sprintf(buf, "CLT: %d.%02dV", mv0/1000, (mv0%1000)/10);
-		ssd1306_SetCursor(0, 26);
+		/* Sensor 0 — coolant temp: engineering unit + raw voltage */
+		sprintf(buf, "CLT: %d C", (int)clt_c);
+		ssd1306_SetCursor(0, 24);
 		ssd1306_WriteString(buf, Font_7x10, SSD1306_COLOR_WHITE);
 
-		/* Sensor 1 — throttle position */
-		sprintf(buf, "TPS: %d.%02dV", mv1/1000, (mv1%1000)/10);
-		ssd1306_SetCursor(0, 40);
+		sprintf(buf, "%d.%02dV", adc_mv0/1000, (adc_mv0%1000)/10);
+		ssd1306_SetCursor(84, 24);
+		ssd1306_WriteString(buf, Font_7x10, SSD1306_COLOR_WHITE);
+
+		/* Sensor 1 — throttle position: engineering unit + raw voltage */
+		sprintf(buf, "TPS: %d%%", tps_pct);
+		ssd1306_SetCursor(0, 38);
+		ssd1306_WriteString(buf, Font_7x10, SSD1306_COLOR_WHITE);
+
+		sprintf(buf, "%d.%02dV", adc_mv1/1000, (adc_mv1%1000)/10);
+		ssd1306_SetCursor(84, 38);
 		ssd1306_WriteString(buf, Font_7x10, SSD1306_COLOR_WHITE);
 
 		/* Push the framebuffer to the display */
 		ssd1306_UpdateScreen();
 
-		/* Also keep the UART output for serial debugging */
-		int len = sprintf(buf, "S0:%d.%02d S1:%d.%02d\r\n",
-		                  mv0/1000, (mv0%1000)/10, mv1/1000, (mv1%1000)/10);
+		/* UART: engineering units + raw voltage for debugging */
+		int len = sprintf(buf, "CLT:%dC(%dmV) TPS:%d%%(%dmV)\r\n",
+		                  (int)clt_c, adc_mv0, tps_pct, adc_mv1);
 		HAL_UART_Transmit(&huart2, (uint8_t *)buf, len, 100);
 
 		osDelay(500);
